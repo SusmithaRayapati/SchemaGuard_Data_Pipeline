@@ -1,0 +1,8 @@
+pandas
+pyarrow
+pytest
+fastapi
+uvicorn
+streamlit
+pydantic
+python-multipart
