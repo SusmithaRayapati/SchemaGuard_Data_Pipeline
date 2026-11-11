@@ -133,4 +133,34 @@ ON quarantine_logs(run_id);
 CREATE INDEX IF NOT EXISTS idx_metrics_run_id
 ON pipeline_metrics(run_id);
 
+CREATE TABLE IF NOT EXISTS processed_orders (
+
+    order_id INTEGER PRIMARY KEY,
+    customer_id INTEGER NOT NULL,
+    order_date TEXT NOT NULL,
+    amount REAL NOT NULL,
+    status TEXT NOT NULL,
+
+    region TEXT,
+    discount REAL DEFAULT 0,
+    discount_amount REAL DEFAULT 0,
+    net_amount REAL NOT NULL,
+
+    order_year INTEGER,
+    order_month INTEGER,
+
+    source_file TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+
+    loaded_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+
+CREATE INDEX IF NOT EXISTS idx_processed_customer
+ON processed_orders(customer_id);
+
+
+CREATE INDEX IF NOT EXISTS idx_processed_run
+ON processed_orders(run_id);
+
 """

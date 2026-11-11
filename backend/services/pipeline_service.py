@@ -3,14 +3,15 @@
 SchemaGuard - Pipeline Orchestration Service
 
 Responsibilities:
-1. Schema detection and evolution.
-2. Record-level data validation.
-3. Compatible nullable column support.
-4. Late-arriving record detection.
-5. Data transformation.
-6. Batch and record quarantine.
-7. SQLite run tracking and metrics.
-8. Empty and malformed batch handling.
+1. Schema detection and evolution
+2. Record-level data validation
+3. Compatible nullable column support
+4. Late-arriving record detection
+5. Data transformation
+6. Batch and record quarantine
+7. SQLite run tracking and metrics
+8. Empty and malformed batch handling
+9. Load transformed records into SQLite
 """
 
 from pathlib import Path
@@ -48,13 +49,14 @@ from backend.database.repository import (
     record_batch,
     record_quarantine,
     record_metric,
-    complete_pipeline_run
+    complete_pipeline_run,
+    load_processed_orders
 )
 
 
-# --------------------------------------------------
+# ==================================================
 # 1. PROJECT CONFIGURATION
-# --------------------------------------------------
+# ==================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -72,21 +74,19 @@ ALLOWED_OPTIONAL_COLUMNS = {
 ALLOWED_LATENESS_DAYS = 2
 
 
-# --------------------------------------------------
+# ==================================================
 # 2. SCHEMA COMPATIBILITY CHECK
-# --------------------------------------------------
+# ==================================================
 
 def inspect_batch_schema(batch_file):
     """
-    Compare incoming schema with the registered schema.
+    Compare incoming Parquet schema with registered schema.
     """
 
     try:
-
         incoming_schema = pq.read_schema(batch_file)
 
     except Exception as error:
-
         return {
             "status": "INVALID_INPUT",
             "schema": None,
@@ -143,7 +143,7 @@ def inspect_batch_schema(batch_file):
         and name not in ALLOWED_OPTIONAL_COLUMNS
     ]
 
-    if not validation["is_valid"]:
+    if not validation["is_valid"] or unexpected_columns:
 
         return {
             "status": "BREAKING",
@@ -153,7 +153,7 @@ def inspect_batch_schema(batch_file):
                 "missing_columns": missing_columns,
                 "changed_columns": changed_columns,
                 "unexpected_columns": unexpected_columns,
-                "validation_errors": validation["errors"]
+                "validation_errors": validation.get("errors", [])
             }
         }
 
@@ -173,17 +173,14 @@ def inspect_batch_schema(batch_file):
     }
 
 
-# --------------------------------------------------
+# ==================================================
 # 3. GET PREVIOUS EVENT-TIME WATERMARK
-# --------------------------------------------------
+# ==================================================
 
 def get_previous_event_time_watermark():
     """
-    Find the maximum order_date from previously
-    processed Parquet files.
-
-    This maximum event time becomes the watermark
-    for the incoming batch.
+    Find maximum order_date from previously processed
+    Parquet files.
     """
 
     if not PROCESSED_DIR.exists():
@@ -215,7 +212,6 @@ def get_previous_event_time_watermark():
                 maximum_event_time is None
                 or batch_maximum > maximum_event_time
             ):
-
                 maximum_event_time = batch_maximum
 
         except Exception as error:
@@ -228,9 +224,9 @@ def get_previous_event_time_watermark():
     return maximum_event_time
 
 
-# --------------------------------------------------
+# ==================================================
 # 4. QUARANTINE ENTIRE BATCH
-# --------------------------------------------------
+# ==================================================
 
 def quarantine_entire_batch(
     batch_file,
@@ -240,8 +236,8 @@ def quarantine_entire_batch(
     quarantine_reason
 ):
     """
-    Quarantine a complete batch when its schema is breaking
-    or the Parquet input is invalid.
+    Quarantine a complete batch for breaking schema
+    or invalid Parquet input.
     """
 
     schema = schema_result.get("schema")
@@ -300,46 +296,46 @@ def quarantine_entire_batch(
     }
 
 
-# --------------------------------------------------
-# 5. RUN PIPELINE FOR ONE BATCH
-# --------------------------------------------------
+# ==================================================
+# 5. MAIN PIPELINE
+# ==================================================
 
 def run_pipeline(source_filename="batch_01.parquet"):
     """
-    Execute the complete pipeline for one Parquet batch.
+    Execute the complete SchemaGuard pipeline.
     """
 
     initialize_database()
 
-    # Prevent path traversal.
-    if Path(source_filename).name != source_filename:
+    # ----------------------------------------------
+    # INPUT VALIDATION
+    # ----------------------------------------------
 
+    if Path(source_filename).name != source_filename:
         raise ValueError(
-            "Only an input filename is accepted, not a path"
+            "Only an input filename is accepted."
         )
 
     if not source_filename.endswith(".parquet"):
-
         raise ValueError(
-            "Input must be a Parquet file"
+            "Input must be a Parquet file."
         )
 
     batch_file = INPUT_DIR / source_filename
 
     if not batch_file.is_file():
-
         raise FileNotFoundError(
             f"Input batch not found: {batch_file}"
         )
 
     if not CUSTOMER_FILE.is_file():
-
         raise FileNotFoundError(
             f"Customer reference file not found: {CUSTOMER_FILE}"
         )
-    # ------------------------------------------
+
+    # ----------------------------------------------
     # IDEMPOTENCY CHECK
-    # ------------------------------------------
+    # ----------------------------------------------
 
     database_path = PROJECT_ROOT / "data" / "schemaguard.db"
 
@@ -363,10 +359,9 @@ def run_pipeline(source_filename="batch_01.parquet"):
 
     if existing_batch:
 
-        print("\nBatch already processed!")
+        print("\nBatch already processed.")
         print("Previous Run ID:", existing_batch[0])
         print("Previous Status:", existing_batch[1])
-        print("Skipping duplicate processing.")
 
         return {
             "status": "SKIPPED_ALREADY_PROCESSED",
@@ -375,6 +370,11 @@ def run_pipeline(source_filename="batch_01.parquet"):
             "previous_status": existing_batch[1],
             "processed_file": existing_batch[2]
         }
+
+    # ----------------------------------------------
+    # CREATE PIPELINE RUN
+    # ----------------------------------------------
+
     run_id = "SG_" + uuid.uuid4().hex[:12].upper()
 
     started = time.perf_counter()
@@ -385,8 +385,8 @@ def run_pipeline(source_filename="batch_01.parquet"):
     )
 
     print("\nStarting SchemaGuard pipeline...")
-    print(f"Run ID: {run_id}")
-    print(f"Source: {source_filename}")
+    print("Run ID:", run_id)
+    print("Source:", source_filename)
 
     try:
 
@@ -400,7 +400,7 @@ def run_pipeline(source_filename="batch_01.parquet"):
 
         fingerprint = schema_result["fingerprint"]
 
-        print(f"\nSchema status: {schema_status}")
+        print("\nSchema status:", schema_status)
 
         # ------------------------------------------
         # STEP 2: BATCH-LEVEL QUARANTINE
@@ -427,7 +427,7 @@ def run_pipeline(source_filename="batch_01.parquet"):
             )
 
         # ------------------------------------------
-        # STEP 3: GET PREVIOUS WATERMARK
+        # STEP 3: PREVIOUS EVENT-TIME WATERMARK
         # ------------------------------------------
 
         print("\nChecking previous event-time watermark...")
@@ -437,7 +437,7 @@ def run_pipeline(source_filename="batch_01.parquet"):
         )
 
         print(
-            "Previous event-time watermark:",
+            "Previous watermark:",
             event_time_watermark
         )
 
@@ -478,20 +478,13 @@ def run_pipeline(source_filename="batch_01.parquet"):
 
         late_count = summary.get("late_records", 0)
 
-        print(f"Input records: {input_count}")
-        print(f"Valid records: {valid_count}")
-        print(f"Rejected records: {rejected_count}")
-        print(f"Late records: {late_count}")
-
-        if schema_status == "COMPATIBLE":
-
-            print(
-                "Compatible optional columns:",
-                schema_result["details"]["new_optional_columns"]
-            )
+        print("Input records:", input_count)
+        print("Valid records:", valid_count)
+        print("Rejected records:", rejected_count)
+        print("Late records:", late_count)
 
         # ------------------------------------------
-        # STEP 5: DATA TRANSFORMATION
+        # STEP 5: TRANSFORMATION
         # ------------------------------------------
 
         print("\nTransforming valid records...")
@@ -500,10 +493,11 @@ def run_pipeline(source_filename="batch_01.parquet"):
 
         output_file = None
 
+        loaded_records = 0
+
         if valid_records.empty:
 
-            print("Empty batch detected. Skipping transformation.")
-            print("No output records generated.")
+            print("No valid records available for transformation.")
 
         else:
 
@@ -528,8 +522,56 @@ def run_pipeline(source_filename="batch_01.parquet"):
                 output_file
             )
 
+                    # ------------------------------------------
+        # STEP 6: SQLITE DATA LOADING
         # ------------------------------------------
-        # STEP 6: RECORD-LEVEL QUARANTINE
+
+        print("\nLoading records into SQLite...")
+
+        required_db_columns = {
+            "order_id",
+            "customer_id",
+            "order_date",
+            "amount",
+            "status",
+            "region",
+            "discount",
+            "discount_amount",
+            "net_amount",
+            "order_year",
+            "order_month",
+            "source_file",
+            "run_id"
+        }
+
+        if not transformed_data.empty:
+
+            missing_db_columns = (
+                required_db_columns
+                - set(transformed_data.columns)
+            )
+
+            if missing_db_columns:
+
+                print(
+                    "Database loading skipped. "
+                    "Transformed data is missing columns:",
+                    sorted(missing_db_columns)
+                )
+
+            else:
+
+                loaded_records = load_processed_orders(
+                    transformed_data
+                )
+
+                print(
+                    "Database records loaded:",
+                    loaded_records
+                )
+
+        # ------------------------------------------
+        # STEP 7: RECORD-LEVEL QUARANTINE
         # ------------------------------------------
 
         record_quarantine_result = None
@@ -556,10 +598,10 @@ def run_pipeline(source_filename="batch_01.parquet"):
                 )
             )
 
-            print("\nRejected records quarantined successfully.")
+            print("\nRejected records quarantined.")
 
         # ------------------------------------------
-        # STEP 7: SAVE BATCH METADATA
+        # STEP 8: BATCH METADATA
         # ------------------------------------------
 
         batch_status = (
@@ -585,7 +627,7 @@ def run_pipeline(source_filename="batch_01.parquet"):
         )
 
         # ------------------------------------------
-        # STEP 8: SAVE METRICS
+        # STEP 9: PIPELINE METRICS
         # ------------------------------------------
 
         processing_time = time.perf_counter() - started
@@ -601,6 +643,10 @@ def run_pipeline(source_filename="batch_01.parquet"):
             ),
             "output_records": (
                 len(transformed_data),
+                "records"
+            ),
+            "database_records": (
+                loaded_records,
                 "records"
             ),
             "rejected_records": (
@@ -623,26 +669,40 @@ def run_pipeline(source_filename="batch_01.parquet"):
             )
 
         # ------------------------------------------
-        # STEP 9: COMPLETE PIPELINE RUN
+        # STEP 10: COMPLETE PIPELINE RUN
         # ------------------------------------------
+
+        final_status = (
+            "PARTIAL"
+            if rejected_count > 0
+            else "SUCCESS"
+        )
 
         complete_pipeline_run(
             run_id=run_id,
-            status="SUCCESS",
+            status=final_status,
             accepted_files=1,
-            quarantined_files=0,
+            quarantined_files=(
+                1 if rejected_count > 0 else 0
+            ),
             total_input_records=input_count,
             total_output_records=len(transformed_data),
             total_rejected_records=rejected_count
         )
 
+        # ------------------------------------------
+        # STEP 11: FINAL RESULT
+        # ------------------------------------------
+
         result = {
             "run_id": run_id,
-            "status": "SUCCESS",
+            "status": final_status,
             "source_file": source_filename,
             "schema_status": schema_status,
             "input_records": input_count,
+            "valid_records": valid_count,
             "output_records": len(transformed_data),
+            "database_records": loaded_records,
             "rejected_records": rejected_count,
             "late_records": late_count,
             "processing_time_seconds": round(
@@ -656,7 +716,7 @@ def run_pipeline(source_filename="batch_01.parquet"):
             )
         }
 
-        print("\nPipeline completed successfully.")
+        print("\nPipeline completed.")
         print(result)
 
         return result
@@ -674,15 +734,16 @@ def run_pipeline(source_filename="batch_01.parquet"):
         except Exception as tracking_error:
 
             print(
-                f"Could not update failed run: {tracking_error}"
+                "Could not update failed run:",
+                tracking_error
             )
 
         raise
 
 
-# --------------------------------------------------
+# ==================================================
 # 6. DIRECT EXECUTION
-# --------------------------------------------------
+# ==================================================
 
 if __name__ == "__main__":
 
